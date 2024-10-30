@@ -34,7 +34,6 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.x509 import DNSName
 import tftpy
 from asn1crypto import cms
-import hexdump
 
 #Scapy global variables
 osName = platform.system()

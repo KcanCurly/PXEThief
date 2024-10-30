@@ -4,16 +4,10 @@ import requests
 import re
 import time
 import os
-import pandas as pd
-from tabulate import tabulate
-#from lib.logger import logger
 from pyasn1.codec.der.decoder import decode
 from pyasn1_modules import rfc5652
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.serialization import PublicFormat
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, ciphers, serialization
