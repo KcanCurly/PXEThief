@@ -15,7 +15,7 @@ import ipaddress
 import socket
 import platform
 import configparser
-import media_variable_file_cryptography as media_crypto
+import src.media_variable_file_cryptography as media_crypto
 import math
 import lxml.etree as ET
 import requests
@@ -26,7 +26,7 @@ import datetime
 from os import walk,system
 from ipaddress import IPv4Network,IPv4Address
 from certipy.lib.certificate import load_pfx
-from sccmwtf import SCCMTools, Tools, CryptoTools, policyBody, msgHeaderPolicy, msgHeader, dateFormat1
+from src.sccmwtf import SCCMTools, Tools, CryptoTools, policyBody, msgHeaderPolicy, msgHeader, dateFormat1
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import ExtensionOID, ObjectIdentifier
