@@ -32,7 +32,7 @@ setup(
     python_requires=">=3.8",
     entry_points={
         "console_scripts": [
-            "pxethief.py=src.pxethief:main"
+            "pxethief=src.pxethief:main"
         ],
     },
 )
